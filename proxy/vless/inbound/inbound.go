@@ -596,6 +596,19 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		return errors.New("unknown request flow " + requestAddons.Flow).AtWarning()
 	}
 
+	uid := account.ID.String()
+	hostPort := connection.RemoteAddr().String()
+	host := hostPort
+	if h, _, err := net.SplitHostPort(hostPort); err == nil && h != "" {
+    	host = h
+	}
+
+	if ok, err := checkAndUpdateIP(ctx, uid, host); err != nil {
+		errors.LogWarningInner(ctx, err, "IP quota check failed; allowing connection")
+	} else if !ok {
+		return errors.New("IP quota exceeded for " + account.ID.String()).AtWarning()
+	}
+
 	if request.Command != protocol.RequestCommandMux {
 		ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
 			From:   connection.RemoteAddr(),

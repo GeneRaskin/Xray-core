@@ -12,9 +12,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xtls/xray-core/app/router"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/strmatcher"
 	"github.com/xtls/xray-core/features/dns"
@@ -83,9 +85,31 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 		return nil, errors.New("unexpected query strategy ", config.QueryStrategy)
 	}
 
-	hosts, err := NewStaticHosts(config.StaticHosts)
-	if err != nil {
-		return nil, errors.New("failed to create hosts").Base(err)
+	var hosts *StaticHosts
+	mphLoaded := false
+	domainMatcherPath := platform.NewEnvFlag(platform.MphCachePath).GetValue(func() string { return "" })
+	if domainMatcherPath != "" {
+		if f, err := os.Open(domainMatcherPath); err == nil {
+			defer f.Close()
+			if m, err := router.LoadGeoSiteMatcher(f, "HOSTS"); err == nil {
+				f.Seek(0, 0)
+				if hostIPs, err := router.LoadGeoSiteHosts(f); err == nil {
+					if sh, err := NewStaticHostsFromCache(m, hostIPs); err == nil {
+						hosts = sh
+						mphLoaded = true
+						errors.LogDebug(ctx, "MphDomainMatcher loaded from cache for DNS hosts, size: ", sh.matchers.Size())
+					}
+				}
+			}
+		}
+	}
+
+	if !mphLoaded {
+		sh, err := NewStaticHosts(config.StaticHosts)
+		if err != nil {
+			return nil, errors.New("failed to create hosts").Base(err)
+		}
+		hosts = sh
 	}
 
 	var clients []*Client
@@ -106,13 +130,12 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 
 	for _, ns := range config.NameServer {
 		clientIdx := len(clients)
-		updateDomain := func(domainRule strmatcher.Matcher, originalRuleIdx int, matcherInfos []*DomainMatcherInfo) error {
+		updateDomain := func(domainRule strmatcher.Matcher, originalRuleIdx int, matcherInfos []*DomainMatcherInfo) {
 			midx := domainMatcher.Add(domainRule)
 			matcherInfos[midx] = &DomainMatcherInfo{
 				clientIdx:     uint16(clientIdx),
 				domainRuleIdx: uint16(originalRuleIdx),
 			}
-			return nil
 		}
 
 		myClientIP := clientIP
@@ -121,8 +144,16 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 			myClientIP = net.IP(ns.ClientIp)
 		}
 
-		disableCache := config.DisableCache || ns.DisableCache
-		serveStale := config.ServeStale || ns.ServeStale
+		disableCache := config.DisableCache
+		if ns.DisableCache != nil {
+			disableCache = *ns.DisableCache
+		}
+
+		serveStale := config.ServeStale
+		if ns.ServeStale != nil {
+			serveStale = *ns.ServeStale
+		}
+
 		serveExpiredTTL := config.ServeExpiredTTL
 		if ns.ServeExpiredTTL != nil {
 			serveExpiredTTL = *ns.ServeExpiredTTL

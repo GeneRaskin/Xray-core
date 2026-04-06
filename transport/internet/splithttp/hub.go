@@ -4,23 +4,28 @@ import (
 	"bytes"
 	"context"
 	gotls "crypto/tls"
+	"encoding/base64"
+	"fmt"
 	"io"
 	"net/http"
-	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
+	"github.com/apernet/quic-go"
+	"github.com/apernet/quic-go/http3"
 	goreality "github.com/xtls/reality"
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	http_proto "github.com/xtls/xray-core/common/protocol/http"
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/hysteria/congestion"
+	"github.com/xtls/xray-core/transport/internet/hysteria/congestion/bbr"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
@@ -99,7 +104,30 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		return
 	}
 
-	h.config.WriteResponseHeader(writer)
+	h.config.WriteResponseHeader(writer, request.Method, request.Header)
+	length := int(h.config.GetNormalizedXPaddingBytes().rand())
+	config := XPaddingConfig{Length: length}
+
+	if h.config.XPaddingObfsMode {
+		config.Placement = XPaddingPlacement{
+			Placement: h.config.XPaddingPlacement,
+			Key:       h.config.XPaddingKey,
+			Header:    h.config.XPaddingHeader,
+		}
+		config.Method = PaddingMethod(h.config.XPaddingMethod)
+	} else {
+		config.Placement = XPaddingPlacement{
+			Placement: PlacementHeader,
+			Header:    "X-Padding",
+		}
+	}
+
+	h.config.ApplyXPaddingToResponse(writer, config)
+
+	if request.Method == "OPTIONS" {
+		writer.WriteHeader(http.StatusOK)
+		return
+	}
 
 	/*
 		clientVer := []int{0, 0, 0}
@@ -110,29 +138,15 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 	*/
 
 	validRange := h.config.GetNormalizedXPaddingBytes()
-	paddingLength := 0
+	paddingValue, paddingPlacement := h.config.ExtractXPaddingFromRequest(request, h.config.XPaddingObfsMode)
 
-	referrer := request.Header.Get("Referer")
-	if referrer != "" {
-		if referrerURL, err := url.Parse(referrer); err == nil {
-			// Browser dialer cannot control the host part of referrer header, so only check the query
-			paddingLength = len(referrerURL.Query().Get("x_padding"))
-		}
-	} else {
-		paddingLength = len(request.URL.Query().Get("x_padding"))
-	}
-
-	if int32(paddingLength) < validRange.From || int32(paddingLength) > validRange.To {
-		errors.LogInfo(context.Background(), "invalid x_padding length:", int32(paddingLength))
+	if !h.config.IsPaddingValid(paddingValue, validRange.From, validRange.To, PaddingMethod(h.config.XPaddingMethod)) {
+		errors.LogInfo(context.Background(), "invalid padding ("+paddingPlacement+") length:", int32(len(paddingValue)))
 		writer.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
-	sessionId := ""
-	subpath := strings.Split(request.URL.Path[len(h.path):], "/")
-	if len(subpath) > 0 {
-		sessionId = subpath[0]
-	}
+	sessionId, seqStr := h.config.ExtractMetaFromRequest(request, h.path)
 
 	if sessionId == "" && h.config.Mode != "" && h.config.Mode != "auto" && h.config.Mode != "stream-one" && h.config.Mode != "stream-up" {
 		errors.LogInfo(context.Background(), "stream-one mode is not allowed")
@@ -178,14 +192,19 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		currentSession = h.upsertSession(sessionId)
 	}
 	scMaxEachPostBytes := int(h.ln.config.GetNormalizedScMaxEachPostBytes().To)
+	isUplinkRequest := false
 
-	if request.Method == "POST" && sessionId != "" { // stream-up, packet-up
-		seq := ""
-		if len(subpath) > 1 {
-			seq = subpath[1]
-		}
+	switch request.Method {
+	case "GET":
+		isUplinkRequest = seqStr != ""
+	default:
+		isUplinkRequest = true
+	}
 
-		if seq == "" {
+	uplinkDataKey := h.config.UplinkDataKey
+
+	if isUplinkRequest && sessionId != "" { // stream-up, packet-up
+		if seqStr == "" {
 			if h.config.Mode != "" && h.config.Mode != "auto" && h.config.Mode != "stream-up" {
 				errors.LogInfo(context.Background(), "stream-up mode is not allowed")
 				writer.WriteHeader(http.StatusBadRequest)
@@ -207,6 +226,7 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 				writer.Header().Set("Cache-Control", "no-store")
 				writer.WriteHeader(http.StatusOK)
 				scStreamUpServerSecs := h.config.GetNormalizedScStreamUpServerSecs()
+				referrer := request.Header.Get("Referer")
 				if referrer != "" && scStreamUpServerSecs.To > 0 {
 					go func() {
 						for {
@@ -233,7 +253,78 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 			return
 		}
 
-		payload, err := io.ReadAll(io.LimitReader(request.Body, int64(scMaxEachPostBytes)+1))
+		dataPlacement := h.config.GetNormalizedUplinkDataPlacement()
+		var headerPayload []byte
+		if dataPlacement == PlacementAuto || dataPlacement == PlacementHeader {
+			var headerPayloadChunks []string
+			for i := 0; true; i++ {
+				chunk := request.Header.Get(fmt.Sprintf("%s-%d", uplinkDataKey, i))
+				if chunk == "" {
+					break
+				}
+				headerPayloadChunks = append(headerPayloadChunks, chunk)
+			}
+			headerPayloadEncoded := strings.Join(headerPayloadChunks, "")
+			headerPayload, err = base64.RawURLEncoding.DecodeString(headerPayloadEncoded)
+			if err != nil {
+				errors.LogInfo(context.Background(), "Invalid base64 in header's payload: ", err.Error())
+				writer.WriteHeader(http.StatusBadRequest)
+				return
+			}
+		}
+
+		var cookiePayload []byte
+		if dataPlacement == PlacementAuto || dataPlacement == PlacementCookie {
+			var cookiePayloadChunks []string
+			for i := 0; true; i++ {
+				cookieName := fmt.Sprintf("%s_%d", uplinkDataKey, i)
+				if c, _ := request.Cookie(cookieName); c != nil {
+					cookiePayloadChunks = append(cookiePayloadChunks, c.Value)
+				} else {
+					break
+				}
+			}
+			cookiePayloadEncoded := strings.Join(cookiePayloadChunks, "")
+			cookiePayload, err = base64.RawURLEncoding.DecodeString(cookiePayloadEncoded)
+			if err != nil {
+				errors.LogInfo(context.Background(), "Invalid base64 in cookies' payload: ", err.Error())
+				writer.WriteHeader(http.StatusBadRequest)
+				return
+			}
+		}
+
+		var bodyPayload []byte
+		if dataPlacement == PlacementAuto || dataPlacement == PlacementBody {
+			var readErr error
+			if request.ContentLength > int64(scMaxEachPostBytes) {
+				errors.LogInfo(context.Background(), "Too large upload. scMaxEachPostBytes is set to ", scMaxEachPostBytes, "but request size exceed it. Adjust scMaxEachPostBytes on the server to be at least as large as client.")
+				writer.WriteHeader(http.StatusRequestEntityTooLarge)
+				return
+			}
+			if request.ContentLength > 0 {
+				bodyPayload = make([]byte, request.ContentLength)
+				_, readErr = io.ReadFull(request.Body, bodyPayload)
+			} else {
+				bodyPayload, readErr = buf.ReadAllToBytes(io.LimitReader(request.Body, int64(scMaxEachPostBytes)+1))
+			}
+			if readErr != nil {
+				errors.LogInfoInner(context.Background(), readErr, "failed to read body payload")
+				writer.WriteHeader(http.StatusBadRequest)
+				return
+			}
+		}
+
+		var payload []byte
+		switch dataPlacement {
+		case PlacementHeader:
+			payload = headerPayload
+		case PlacementCookie:
+			payload = cookiePayload
+		case PlacementBody:
+			payload = bodyPayload
+		case PlacementAuto:
+			payload = slices.Concat(headerPayload, cookiePayload, bodyPayload)
+		}
 
 		if len(payload) > scMaxEachPostBytes {
 			errors.LogInfo(context.Background(), "Too large upload. scMaxEachPostBytes is set to ", scMaxEachPostBytes, "but request size exceed it. Adjust scMaxEachPostBytes on the server to be at least as large as client.")
@@ -241,13 +332,7 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 			return
 		}
 
-		if err != nil {
-			errors.LogInfoInner(context.Background(), err, "failed to upload (ReadAll)")
-			writer.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-
-		seqInt, err := strconv.ParseUint(seq, 10, 64)
+		seq, err := strconv.ParseUint(seqStr, 10, 64)
 		if err != nil {
 			errors.LogInfoInner(context.Background(), err, "failed to upload (ParseUint)")
 			writer.WriteHeader(http.StatusInternalServerError)
@@ -256,13 +341,18 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 
 		err = currentSession.uploadQueue.Push(Packet{
 			Payload: payload,
-			Seq:     seqInt,
+			Seq:     seq,
 		})
 
 		if err != nil {
 			errors.LogInfoInner(context.Background(), err, "failed to upload (PushPayload)")
 			writer.WriteHeader(http.StatusInternalServerError)
 			return
+		}
+
+		if len(bodyPayload) == 0 {
+			// Methods without a body are usually cached by default.
+			writer.Header().Set("Cache-Control", "no-store")
 		}
 
 		writer.WriteHeader(http.StatusOK)
@@ -396,7 +486,34 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 		if err != nil {
 			return nil, errors.New("failed to listen UDP for XHTTP/3 on ", address, ":", port).Base(err)
 		}
-		l.h3listener, err = quic.ListenEarly(Conn, tlsConfig, nil)
+		if streamSettings.UdpmaskManager != nil {
+			pktConn, err := streamSettings.UdpmaskManager.WrapPacketConnServer(Conn)
+			if err != nil {
+				Conn.Close()
+				return nil, errors.New("mask err").Base(err)
+			}
+			Conn = pktConn
+		}
+
+		quicParams := streamSettings.QuicParams
+		if quicParams == nil {
+			quicParams = &internet.QuicParams{
+				BbrProfile: string(bbr.ProfileStandard),
+				UdpHop:     &internet.UdpHop{},
+			}
+		}
+
+		quicConfig := &quic.Config{
+			InitialStreamReceiveWindow:     quicParams.InitStreamReceiveWindow,
+			MaxStreamReceiveWindow:         quicParams.MaxStreamReceiveWindow,
+			InitialConnectionReceiveWindow: quicParams.InitConnReceiveWindow,
+			MaxConnectionReceiveWindow:     quicParams.MaxConnReceiveWindow,
+			MaxIdleTimeout:                 time.Duration(quicParams.MaxIdleTimeout) * time.Second,
+			MaxIncomingStreams:             quicParams.MaxIncomingStreams,
+			DisablePathMTUDiscovery:        quicParams.DisablePathMtuDiscovery,
+		}
+
+		l.h3listener, err = quic.ListenEarly(Conn, tlsConfig, quicConfig)
 		if err != nil {
 			return nil, errors.New("failed to listen QUIC for XHTTP/3 on ", address, ":", port).Base(err)
 		}
@@ -408,8 +525,30 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 			Handler: handler,
 		}
 		go func() {
-			if err := l.h3server.ServeListener(l.h3listener); err != nil {
-				errors.LogErrorInner(ctx, err, "failed to serve HTTP/3 for XHTTP/3")
+			for {
+				conn, err := l.h3listener.Accept(context.Background())
+				if err != nil {
+					errors.LogInfoInner(ctx, err, "XHTTP/3 listener closed")
+					return
+				}
+
+				switch quicParams.Congestion {
+				case "force-brutal":
+					errors.LogDebug(context.Background(), conn.RemoteAddr(), " ", "congestion brutal bytes per second ", quicParams.BrutalUp)
+					congestion.UseBrutal(conn, quicParams.BrutalUp)
+				case "reno":
+					errors.LogDebug(context.Background(), conn.RemoteAddr(), " ", "congestion reno")
+				default:
+					errors.LogDebug(context.Background(), conn.RemoteAddr(), " ", "congestion bbr ", quicParams.BbrProfile)
+					congestion.UseBBR(conn, bbr.Profile(quicParams.BbrProfile))
+				}
+
+				go func() {
+					if err := l.h3server.ServeQUICConn(conn); err != nil {
+						errors.LogDebugInner(ctx, err, "XHTTP/3 connection ended")
+					}
+					_ = conn.CloseWithError(0, "")
+				}()
 			}
 		}()
 	} else { // tcp
@@ -421,6 +560,10 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 			return nil, errors.New("failed to listen TCP for XHTTP on ", address, ":", port).Base(err)
 		}
 		errors.LogInfo(ctx, "listening TCP for XHTTP on ", address, ":", port)
+	}
+
+	if !l.isH3 && streamSettings.TcpmaskManager != nil {
+		l.listener, _ = streamSettings.TcpmaskManager.WrapListener(l.listener)
 	}
 
 	// tcp/unix (h1/h2)
@@ -443,7 +586,7 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 		l.server = http.Server{
 			Handler:           handler,
 			ReadHeaderTimeout: time.Second * 4,
-			MaxHeaderBytes:    8192,
+			MaxHeaderBytes:    l.config.GetNormalizedServerMaxHeaderBytes(),
 			Protocols:         protocols,
 		}
 		go func() {
@@ -471,8 +614,10 @@ func (ln *Listener) Addr() net.Addr {
 func (ln *Listener) Close() error {
 	if ln.h3server != nil {
 		if err := ln.h3server.Close(); err != nil {
+			_ = ln.h3listener.Close()
 			return err
 		}
+		return ln.h3listener.Close()
 	} else if ln.listener != nil {
 		return ln.listener.Close()
 	}

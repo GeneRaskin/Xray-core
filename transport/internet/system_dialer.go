@@ -2,12 +2,9 @@ package internet
 
 import (
 	"context"
-	"math/rand"
-	gonet "net"
 	"syscall"
 	"time"
 
-	"github.com/sagernet/sing/common/control"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/features/dns"
@@ -22,7 +19,7 @@ type SystemDialer interface {
 }
 
 type DefaultSystemDialer struct {
-	controllers []control.Func
+	controllers []func(network, address string, c syscall.RawConn) error
 	dns         dns.Client
 	obm         outbound.Manager
 }
@@ -84,12 +81,12 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 			return nil, err
 		}
 		return &PacketConnWrapper{
-			Conn: packetConn,
-			Dest: destAddr,
+			PacketConn: packetConn,
+			Dest:       destAddr,
 		}, nil
 	}
 	// Chrome defaults
-	keepAliveConfig := gonet.KeepAliveConfig{
+	keepAliveConfig := net.KeepAliveConfig{
 		Enable:   true,
 		Idle:     45 * time.Second,
 		Interval: 45 * time.Second,
@@ -151,49 +148,21 @@ func (d *DefaultSystemDialer) DestIpAddress() net.IP {
 }
 
 type PacketConnWrapper struct {
-	Conn net.PacketConn
+	net.PacketConn
 	Dest net.Addr
 }
 
-func (c *PacketConnWrapper) Close() error {
-	return c.Conn.Close()
+func (c *PacketConnWrapper) Read(p []byte) (int, error) {
+	n, _, err := c.PacketConn.ReadFrom(p)
+	return n, err
 }
 
-func (c *PacketConnWrapper) LocalAddr() net.Addr {
-	return c.Conn.LocalAddr()
+func (c *PacketConnWrapper) Write(p []byte) (int, error) {
+	return c.PacketConn.WriteTo(p, c.Dest)
 }
 
 func (c *PacketConnWrapper) RemoteAddr() net.Addr {
 	return c.Dest
-}
-
-func (c *PacketConnWrapper) Write(p []byte) (int, error) {
-	return c.Conn.WriteTo(p, c.Dest)
-}
-
-func (c *PacketConnWrapper) Read(p []byte) (int, error) {
-	n, _, err := c.Conn.ReadFrom(p)
-	return n, err
-}
-
-func (c *PacketConnWrapper) WriteTo(p []byte, d net.Addr) (int, error) {
-	return c.Conn.WriteTo(p, d)
-}
-
-func (c *PacketConnWrapper) ReadFrom(p []byte) (int, net.Addr, error) {
-	return c.Conn.ReadFrom(p)
-}
-
-func (c *PacketConnWrapper) SetDeadline(t time.Time) error {
-	return c.Conn.SetDeadline(t)
-}
-
-func (c *PacketConnWrapper) SetReadDeadline(t time.Time) error {
-	return c.Conn.SetReadDeadline(t)
-}
-
-func (c *PacketConnWrapper) SetWriteDeadline(t time.Time) error {
-	return c.Conn.SetWriteDeadline(t)
 }
 
 type SystemDialerAdapter interface {
@@ -234,7 +203,7 @@ func UseAlternativeSystemDialer(dialer SystemDialer) {
 // It only works when effective dialer is the default dialer.
 //
 // xray:api:beta
-func RegisterDialerController(ctl control.Func) error {
+func RegisterDialerController(ctl func(network, address string, c syscall.RawConn) error) error {
 	if ctl == nil {
 		return errors.New("nil listener controller")
 	}
@@ -262,14 +231,15 @@ func (c *FakePacketConn) WriteTo(p []byte, _ net.Addr) (n int, err error) {
 }
 
 func (c *FakePacketConn) LocalAddr() net.Addr {
-	return &net.TCPAddr{
-		IP:   net.IP{byte(rand.Intn(256)), byte(rand.Intn(256)), byte(rand.Intn(256)), byte(rand.Intn(256))},
-		Port: rand.Intn(65536),
+	return &net.UDPAddr{
+		IP:   []byte{0, 0, 0, 0},
+		Port: 0,
 	}
 }
 
-func (c *FakePacketConn) SetReadBuffer(bytes int) error {
-	// do nothing, this function is only there to suppress quic-go printing
-	// random warnings about UDP buffers to stdout
-	return nil
+func (c *FakePacketConn) RemoteAddr() net.Addr {
+	return &net.UDPAddr{
+		IP:   []byte{0, 0, 0, 0},
+		Port: 0,
+	}
 }

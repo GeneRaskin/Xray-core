@@ -70,13 +70,19 @@ func (s *statsServer) GetStatsOnlineIpList(ctx context.Context, request *GetStat
 	}
 
 	ips := make(map[string]int64)
-	for ip, t := range c.IpTimeMap() {
+	for ip, t := range c.IPTimeMap() {
 		ips[ip] = t.Unix()
 	}
 
 	return &GetStatsOnlineIpListResponse{
 		Name: request.Name,
 		Ips:  ips,
+	}, nil
+}
+
+func (s *statsServer) GetAllOnlineUsers(ctx context.Context, request *GetAllOnlineUsersRequest) (*GetAllOnlineUsersResponse, error) {
+	return &GetAllOnlineUsersResponse{
+		Users: s.stats.GetAllOnlineUsers(),
 	}, nil
 }
 

@@ -161,6 +161,21 @@ func (m *Manager) GetChannel(name string) stats.Channel {
 	return nil
 }
 
+// GetAllOnlineUsers implements stats.Manager.
+func (m *Manager) GetAllOnlineUsers() []string {
+	m.access.RLock()
+	defer m.access.RUnlock()
+
+	usersOnline := make([]string, 0, len(m.onlineMap))
+	for user, onlineMap := range m.onlineMap {
+		if onlineMap.Count() > 0 {
+			usersOnline = append(usersOnline, user)
+		}
+	}
+
+	return usersOnline
+}
+
 // Start implements common.Runnable.
 func (m *Manager) Start() error {
 	m.access.Lock()
